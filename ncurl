@@ -1,0 +1,261 @@
+#!/bin/bash
+
+# Since posting this, I stumbled across the 'lftp' command, which performs
+# all the features below but has been out a while and is maintained, so you
+# should use that instead.
+#
+#
+# (Joe Mullally)
+#
+# ncurl: 
+#   a Multipart Downloader/Download Accelerator wrapper script for curl.
+#
+# This script uses multiple connections to download files from HTTP/FTP servers
+# which can support this, similar to Free Download Manager, DownThemAll, Axel.
+# This can be used from the terminal (under screen etc) like Axel, but unlike
+# Axel, it supports SSL and HTTP authentication as it uses curl underneath.
+#
+# To use, pass the script regular curl options, and ensure a single URL is the
+# last argument. Eg:
+#
+#   ncurl -k --user jwm:p4ssw0rd https://www.sslserver.com/file.tgz
+#   N=3 ncurl http://www.server.com/file.zip
+#
+# The second line gives an example of changing the number of connections to 3.
+# 
+# If the script throws an error, try checking access to the file with 
+# regular curl first.
+#
+# The output filename is extracted from the URL. Note currently only
+# one URL/file at a time can be specified. To queue up multiple
+# files, you can scheduele seperate multicurl commands to run in the
+# shell (e.g. cmd1; cmd2; cmd3).
+#
+#
+# Attack:
+#
+# The script first fetches the file size, and if accessing this goes OK, 
+# it then launches multiple 'curl' processes in the background to download
+# each section of the file. If partially downloaded file parts are present,
+# it attempts to resume them. Once all the parts are finished downloading,
+# it joins them together one by one, leaving the complete file. 
+# Total space required is TOTAL_SIZE + TOTAL_SIZE/#(N_SECTIONS)
+#
+# Thanks to:
+# http://linuxandfriends.com/2008/11/01/curl-split-a-file-and-download-simultaneously-from-multiple-locations/
+# for the idea.
+#
+#
+# Sample output:
+#
+#   $ ncurl http://ftp.heanet.ie/debian/ls-lR.patch.gz
+#   
+#   Downloading http://ftp.heanet.ie/debian/ls-lR.patch.gz ==> ls-lR.patch.gz
+#   
+#   Getting file size from server...
+#   Length: 153083
+#   Starting 4 curl section downloads...
+#   
+#   ls-lR.patch.gz.part1 [0-38269] downloading...
+#   ls-lR.patch.gz.part2 [38270-76540] downloading...
+#   ls-lR.patch.gz.part3 [76541-114811] downloading...
+#   ls-lR.patch.gz.part4 [114812-153082] downloading...
+#   
+#   .part1: 100% 38270 - 38270: 0 k/s
+#   .part2: 100% 38271 - 38271: 1 k/s
+#   .part3: 100% 38271 - 38271: 0 k/s
+#   .part4: 100% 38271 - 38271: 0 k/s
+#   ----
+#   Total:  100% 153083 - 153083: 1 k/s, eta 0h 0m 0s
+#   
+#   Reassembling file: ... 153083 ls-lR.patch.gz
+#   Download complete.
+# 
+#
+# Addendum:
+#
+# Some of the error checking and features are HTTP/FTP specific. Could be made
+# work with other curl supported protocols? curl manual says only HTTP/FTP
+# supports --range as of curl 7.21.6 (April 22, 2011).
+#
+# The ETA feature is a pretty rough estimate. It is based on what
+# is written out to files and excludes curl internal buffers.
+# It seems to work well enough for a rough estimate.
+#
+# The output of each curl part could be written directly to a
+# single big file by piping it through 'dd', therefore not needing the
+# intermediate part files, but this would make resuming a previously
+# incomplete download much more difficult and probably require persistant
+# control files and better integration with curl (ie hacking). At that
+# stage, you might as well add multipart downloading into curl itself.
+#
+# More addendum:
+# 
+# Argh, when checking to see if the name multicurl was taken by anything,
+# I found these projects which do exactly what this script does (Where
+# were you guys when I was searching earlier):
+#
+#  McURL - http://www.GoForLinux.de/scripts/mcurl/
+#  multicurl - http://code.google.com/p/multicurl/
+#
+# Reading McURL in particular is quite amusing as the it carries out 
+# roughly the same steps as in this script,only 9 years earlier in 2002:)
+#
+# However, both of the above tools don't allow passing further arguments
+# onto curl, which is needed for authentication and some HTTPS cases which was
+# my primary motivation for writing this tool, so I may as well release it.
+#
+
+if [ -z "$N" ]; then
+    N=4                         # Number of sections. (can be set externally)
+fi
+PROGRESS_INTERVAL=1             # Number of seconds between progress updates.
+CURL_OPTS="--silent --show-error"
+
+print_help_exit() {
+    echo -e "ncurl: multipart download accelerator wrapper script for curl.\n"
+    echo "To use, pass the script regular curl options and ensure a single URL"
+    echo -e "is the last argument. Optionally set N before running the command"
+    echo -e "to set the number of connections to use. Eg:\n"
+    echo -e "  ncurl http://www.server.com/file.zip\n"
+    echo    "  ncurl -k --user jim:p4ssw0rd https://www.sslserver.com/file.tgz"
+    echo    "  N=2 ncurl https://www.server.com/file.zip"
+    echo -e "\nSee the regular curl --help for more options\n"
+    exit
+}
+
+if [ -z $@ ]; then 
+    print_help_exit; 
+fi
+
+for ARG in $@; do
+    if [ "$ARG" = "--help" ] || [ "$ARG" = "-h" ]; then
+        print_help_exit
+    fi
+done
+
+# Get filename similar to how curl -O does it (see src/main.c:GETOUT_USEREMOTE)
+# (ie last part after '/' )
+OUTFILE=`basename \"/${@: -1}\" \"`
+echo -e "\nDownloading ${@: -1} ==> $OUTFILE"
+if [ -e $OUTFILE ]; then
+    echo -e "\n$OUTFILE already exists, exiting..."
+    exit
+fi
+
+echo -e "\nGetting file size from server..."
+HEADER=`curl --silent --show-error --head --write-out "response_code: %{response_code}\n" $@`
+if [ $? -ne 0 ]; then
+    echo -e "\ncurl error fetching file size, exiting..."
+    exit
+fi
+RESPONSE_CODE=`echo "$HEADER" | grep "response_code:" | awk '{ print $2 }'`
+# 200 == HTTP/FTP OK; 350 == FTP OK, file operation pending
+if [ "$RESPONSE_CODE" -ne 200 ] && [ "$RESPONSE_CODE" -ne 350 ]; then
+    echo -e "\nUnable to access file. Server response:\n\n$HEADER\n"
+    echo "Check access using regular 'curl'. Exiting..."
+    exit
+fi
+# Final awk converts DOS newlines to UNIX, otherwise
+# shell arithmetic with $LENGTH breaks.
+LENGTH=`echo "$HEADER" | grep "Content-Length:" | awk '{ print $2 }' | awk '{sub(/\r$/,"")};1'`
+if [ -z "$LENGTH" ]; then
+    echo -e "\nServer didn't return Content-Length, can't get file size"
+    echo "needed for multipart downloading."
+    exit
+fi
+echo "Length: $LENGTH"
+
+on_sigterm() {
+    echo -e "\nTERM or INT signal received, attempting to kill"
+    echo -e "all 'curl' subprocesses...\n"
+    for child in `jobs -rp`; do kill $child; done
+    exit
+}
+trap 'on_sigterm' TERM INT
+
+echo -e "Starting $N curl section downloads...\n"
+for i in `seq $N`; do
+    LWR=$((($i-1)*$LENGTH/$N))
+    if [ $i -eq $N ]; then
+        UPR=$(($LENGTH-1))
+    else
+        UPR=$(($i*$LENGTH/$N-1))
+    fi
+    SIZES[$i]=$(($UPR-$LWR+1))
+    # For resumable downloading, curl --continue-at doesn't seem to work with 
+    # --range, so we check existing file sizes and set up the ranges manually.
+    if [ -e $OUTFILE.part$i ]; then
+        FSIZE=`stat -c%s $OUTFILE.part$i`
+        if [ $FSIZE -eq $(($UPR-$LWR+1)) ]; then
+            echo "$OUTFILE.part$i [$LWR-$UPR] already downloaded."
+            continue
+        elif [ $FSIZE -ge $(($UPR-$LWR+1)) ]; then
+            echo -e "\n$OUTFILE.part$i [$LWR-$UPR] error:"
+            echo "File on disk ($FSIZE) larger than section to be downloaded."
+            echo "Did the file or number of sections change since last run?"
+            exit
+        else
+            LWR=$(($LWR+$FSIZE))
+            echo "$OUTFILE.part$i [$LWR-$UPR] resuming..."
+        fi
+    else
+        echo "$OUTFILE.part$i [$LWR-$UPR] downloading..."
+    fi
+    curl $CURL_OPTS --range $LWR-$UPR $@ >> $OUTFILE.part$i &
+done
+
+blank_prev_lines() {     # $1 == Number of previous lines to blank
+    echo -ne "\x1b[2K"                                    # Clear current line
+    for i in `seq $1`; do echo -ne "\x1b[1A\x1b[2K"; done # Move up and clear
+    echo -ne "\x1b[0G"                                    # Goto start of line
+}
+
+print_progress() {
+    blank_prev_lines $(($N+2))
+    TOTAL_DONE=0
+    TOTAL_RATE=0
+    for i in `seq $N`; do
+        FSIZE=`stat -c%s $OUTFILE.part$i`
+        PERCENT=$((100*$FSIZE/${SIZES[$i]}))
+        if [ -z ${PREV_FSIZES[$i]} ]; then PREV_FSIZES[$i]=$FSIZE; fi
+        RATE=$((( ($FSIZE-${PREV_FSIZES[$i]})/$PROGRESS_INTERVAL)/1024))
+        echo ".part$i: $PERCENT% ${SIZES[$i]} - $FSIZE: $RATE k/s"
+        PREV_FSIZES[$i]=$FSIZE
+        TOTAL_DONE=$(($TOTAL_DONE+$FSIZE))
+        TOTAL_RATE=$(($TOTAL_RATE+$RATE))
+    done
+    if [ ! "$TOTAL_RATE" = "0" ]; then
+        ETA=$((( ($LENGTH-$TOTAL_DONE)/1024)/$TOTAL_RATE))
+        ETASTR="$(($ETA/3600))h $(($ETA/60))m $(($ETA%60))s"
+    else
+        ETASTR="--"
+    fi
+    echo "----"
+    echo "Total:  $((100*$TOTAL_DONE/$LENGTH))% $LENGTH - $TOTAL_DONE: $TOTAL_RATE k/s, eta $ETASTR"
+}
+
+# Wait for all running curl processes to finish downloading
+for i in `seq $(($N+3))`; do echo; done;
+LOOPCNT=0
+while [ -n "`jobs -rp`" ]; do
+    if [ "$LOOPCNT" -eq "0" ]; then
+        print_progress
+    fi
+    LOOPCNT=$((($LOOPCNT+1)%(2*$PROGRESS_INTERVAL)))
+    sleep 0.5         # kindof ineffecient - what if the download is just done?
+done
+print_progress        # Print progress again to show all files finished at 100%
+
+echo -en "\nReassembling file: ... "
+for i in `seq $N`; do
+    cat $OUTFILE.part$i >> $OUTFILE
+    rm -f $OUTFILE.part$i
+done
+
+ls -l $OUTFILE | awk '{ print $5" "$8 }'
+echo "Download complete."
+if [ $LENGTH -ne `stat -c%s $OUTFILE` ]; then
+    echo "Warning: file has a different length than size reported by server."
+fi
+
