@@ -1,0 +1,192 @@
+#!/usr/bin/env stap
+
+# jwm, License: GPLv2
+# Based on Sourceware.org SystemTap examples: nettop.stp, tcp_trace.stp
+
+# Periodically print a summary of all TCP packets sent and received by
+# local processes in the last interval (5s), along with the PID and 
+# process name if they can be determined.
+#
+# A similar tool for Dtrace exists at:
+#    http://www.brendangregg.com/DTrace/tcptop
+#
+#
+# Run with (ubuntu, debian?):
+#     # apt-get install systemtap linux-image-`uname -r`-dbgsym
+#     # ./tcptop.stp
+#
+#
+# Output:
+#
+#        127.0.0.1:8080  <--       127.0.0.1:43682    1317  2073:squid
+#        127.0.0.1:43682 <--       127.0.0.1:8080    55445  6668:w3m
+#        127.0.0.1:8080  -->       127.0.0.1:43682   54445  2073:squid
+#        127.0.0.1:43682 -->       127.0.0.1:8080      357  6668:w3m
+#    192.168.2.102:22    <--   192.168.2.115:45207    3888  5909:sshd
+#    192.168.2.102:22    <--   192.168.2.115:50500      32 -:-
+#    192.168.2.102:41213 -->  74.125.230.113:80        472  2073:squid
+#    192.168.2.102:40884 <--   74.125.230.96:443      1478  1961:firefox-bin
+#    192.168.2.102:22    -->   192.168.2.115:50500     896 -:-
+#    192.168.2.102:22    -->   192.168.2.115:45207    6048  5909:sshd
+#    192.168.2.102:41213 <--  74.125.230.113:80      55625  2073:squid
+#    192.168.2.102:40884 -->   74.125.230.96:443      1609  1961:firefox-bin
+#          0.0.0.0:54006 <--         0.0.0.0:8080       20 -:-
+#          0.0.0.0:54006 -->         0.0.0.0:8080        0 -:-
+#        127.0.0.1:8080  <--         0.0.0.0:0          40 -:-
+#
+
+
+
+# $sk is the process socket.
+# $skb is the packet skbuff.
+# 
+# http://ftp.gnumonks.org/pub/doc/skb-doc.html
+#  "skbuffs are the buffers in which the linux kernel handles network
+#   packets. The packet is received by the network card, put into a skbuff
+#   and then passed to the network stack, which uses the skbuff all the time."
+# 
+
+# Mapping packets -> PIDs:
+# For monitoring individual packets (and not tcp message start/stop),
+# it seems pretty difficult to find the PID from the socket without
+# searching the lists of sockets for each processes (e.g. netstat).
+#
+# These tcp packet functions below are called in kernel threads without access
+# to the PID but with access to the program socket, so cache the socket 
+# information and (hopefully) look up the PID for the socket later.
+
+
+# TODO: - Headers
+#       - Sort output by local:remote addresses
+#       - Trace UDP packets
+#       - Clear terminal each refresh? (vt100 cmds, no ncurses)
+#       - Find already open socket unknown PIDs by walking open fd's?
+#           e.g. netstat /proc, or in kernel. Hard.
+
+
+global packets
+global sock_to_pid
+global sock_to_exec
+global has_disconnected
+
+
+probe kernel.function("tcp_transmit_skb")
+{
+    laddr = tcpmib_local_addr($sk)
+    lport = tcpmib_local_port($sk)
+    raddr = tcpmib_remote_addr($sk)
+    rport = tcpmib_remote_port($sk)
+    length = $skb->len
+
+#    printf("xmit: %d %15s:%d  -->  %15s:%d %d\n", $sk, ip_ntop(htonl(laddr)),
+#            lport, ip_ntop(htonl(raddr)), rport, length)
+
+    packets[$sk, laddr, lport, "-->", raddr, rport] <<< length
+}
+
+
+probe   kernel.function("tcp_rcv_established"),
+        kernel.function("tcp_rcv_state_process")
+{
+    # Use the above kernel function probes instead of tcp.receive, 
+    # as tcp.receive traces a point in the kernel before the socket 
+    # is known for the incoming packet.
+
+    laddr = tcpmib_local_addr($sk)
+    lport = tcpmib_local_port($sk)
+    raddr = tcpmib_remote_addr($sk)
+    rport = tcpmib_remote_port($sk)
+    length = $skb->len;
+
+#    printf("recv: %d %15s %d  <--  %15s %d %d\n", $sk, ip_ntop(htonl(laddr)),
+#            lport, ip_ntop(htonl(raddr)), rport, length)
+
+    packets[$sk, laddr, lport, "<--", raddr, rport] <<< length
+}
+
+
+probe kernel.function("tcp_sendmsg"),
+      kernel.function("tcp_sendmsg").return
+{
+    # 'struct socket *sock' argument changed names in newer 
+    # kernel versions. Try $sk if $sock is undefined.
+    laddr = tcpmib_local_addr($sock)
+    lport = tcpmib_local_port($sock)
+    raddr = tcpmib_remote_addr($sock)
+    rport = tcpmib_remote_port($sock)
+
+#    printf("sendmsg: %d %15s:%d  -->  %15s:%d %d %s\n", 
+#            $sock, ip_ntop(htonl(laddr)), lport, 
+#            ip_ntop(htonl(raddr)), rport, pid(), execname())
+
+    sock_to_pid[$sock, laddr, lport, raddr, rport] = pid()
+    sock_to_exec[$sock, laddr, lport, raddr, rport] = execname()
+}
+
+
+probe kernel.function("tcp_recvmsg"),
+      kernel.function("tcp_recvmsg").return
+{
+    laddr = tcpmib_local_addr($sk)
+    lport = tcpmib_local_port($sk)
+    raddr = tcpmib_remote_addr($sk)
+    rport = tcpmib_remote_port($sk)
+
+#    printf("recvmsg: %d %15s:%5d  <--  %15s:%5d %d %s\n", 
+#            $sk, ip_ntop(htonl(laddr)), lport, 
+#            ip_ntop(htonl(raddr)), rport, pid(), execname())
+
+    sock_to_pid[$sk, laddr, lport, raddr, rport] = pid()
+    sock_to_exec[$sk, laddr, lport, raddr, rport] = execname()
+}
+
+
+probe kernel.function("tcp_disconnect")
+{
+    laddr = tcpmib_local_addr($sk)
+    lport = tcpmib_local_port($sk)
+    raddr = tcpmib_remote_addr($sk)
+    rport = tcpmib_remote_port($sk)
+
+    has_disconnected[$sk, laddr, lport, raddr, rport] = 1
+}
+
+
+function print_activity()
+{
+    printnl = 0
+
+    foreach ([sk, laddr, lport, dir, raddr, rport] in packets) {
+
+        local_addr = sprintf("%15s:%-5d",ip_ntop(htonl(laddr)), lport)
+        remote_addr = sprintf("%15s:%-5d",ip_ntop(htonl(raddr)) ,rport)
+
+        n_bytes = @sum(packets[sk, laddr, lport, dir, raddr, rport])
+        if ([sk, laddr, lport, raddr, rport] in sock_to_pid) {
+            progname = sprintf("%5d:%s",
+                    sock_to_pid[sk, laddr, lport, raddr, rport],
+                    sock_to_exec[sk, laddr, lport, raddr, rport])
+        } else {
+            progname = "-:-"
+        }
+        printf("%s %s %s %7d %s\n", 
+                local_addr, dir, remote_addr, n_bytes, progname)
+        printnl = 1
+    }
+    if (printnl == 1) {
+        print("\n")
+    }
+
+    foreach ([sk, laddr, lport, raddr, rport] in has_disconnected) {
+        delete sock_to_pid[sk, laddr, lport, raddr, rport]
+        delete sock_to_exec[sk, laddr, lport, raddr, rport]
+    }
+    delete has_disconnected
+    delete packets
+}
+
+
+probe timer.ms(5000), end, error
+{
+    print_activity()
+}
